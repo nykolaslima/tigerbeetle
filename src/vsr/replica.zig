@@ -5720,11 +5720,11 @@ pub fn ReplicaType(
                     break :repair_min 0;
                 }
 
-                const op_checkpoint_trigger =
-                    vsr.Checkpoint.trigger_for_checkpoint(self.op_checkpoint()).?;
+                const op_checkpoint_prepare_max =
+                    vsr.Checkpoint.prepare_max_for_checkpoint(self.op_checkpoint()).?;
                 // After state sync, commit_max might lag behind checkpoint_op.
-                maybe(self.commit_max < op_checkpoint_trigger);
-                if (self.commit_max > op_checkpoint_trigger) {
+                maybe(self.commit_max < op_checkpoint_prepare_max);
+                if (self.commit_max > op_checkpoint_prepare_max) {
                     if (self.op == self.op_checkpoint()) {
                         // Don't allow "op_repair_min > op_head".
                         break :repair_min self.op_checkpoint();
@@ -8734,8 +8734,7 @@ pub fn ReplicaType(
             // );
         }
 
-        fn sync_superblock_update_callback(superblock_context: *SuperBlock.Context) void {
-            const self: *Self = @fieldParentPtr("superblock_context", superblock_context);
+        fn sync_superblock_update_callback(self: *Self) void {
             assert(self.sync_tables == null);
             assert(self.grid.read_global_queue.empty());
             assert(self.grid.write_queue.empty());
