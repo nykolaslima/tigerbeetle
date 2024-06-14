@@ -1628,49 +1628,53 @@ pub fn StateMachineType(
             if (dr_account.debits_exceed_credits(amount)) return .exceeds_credits;
             if (cr_account.credits_exceed_debits(amount)) return .exceeds_debits;
 
-            // After this point, the transfer must succeed.
-            defer assert(self.commit_timestamp == t.timestamp);
+            // After this point, the transfer must succeed atomically.
+            var result: CreateTransferResult = undefined;
+            defer assert(result == .ok);
+            defer if (operation == .create_transfers) assert(self.commit_timestamp == t.timestamp);
+            result = completed_atomically: {
+                var t2 = t.*;
+                t2.amount = amount;
+                self.forest.grooves.transfers.insert(&t2);
 
-            var t2 = t.*;
-            t2.amount = amount;
-            self.forest.grooves.transfers.insert(&t2);
+                var dr_account_new = dr_account.*;
+                var cr_account_new = cr_account.*;
+                if (t.flags.pending) {
+                    dr_account_new.debits_pending += amount;
+                    cr_account_new.credits_pending += amount;
 
-            var dr_account_new = dr_account.*;
-            var cr_account_new = cr_account.*;
-            if (t.flags.pending) {
-                dr_account_new.debits_pending += amount;
-                cr_account_new.credits_pending += amount;
-
-                self.forest.grooves.transfers_pending.insert(&.{
-                    .timestamp = t2.timestamp,
-                    .status = .pending,
-                });
-            } else {
-                dr_account_new.debits_posted += amount;
-                cr_account_new.credits_posted += amount;
-            }
-            self.forest.grooves.accounts.update(.{ .old = dr_account, .new = &dr_account_new });
-            self.forest.grooves.accounts.update(.{ .old = cr_account, .new = &cr_account_new });
-
-            self.historical_balance(.{
-                .transfer = &t2,
-                .dr_account = &dr_account_new,
-                .cr_account = &cr_account_new,
-            });
-
-            if (t.timeout > 0) {
-                assert(t.flags.pending);
-                assert(operation == .create_transfers);
-                const expires_at = t.timestamp + t.timeout_ns();
-                if (expires_at < self.expire_pending_transfers.pulse_next_timestamp) {
-                    self.expire_pending_transfers.pulse_next_timestamp = expires_at;
+                    self.forest.grooves.transfers_pending.insert(&.{
+                        .timestamp = t2.timestamp,
+                        .status = .pending,
+                    });
+                } else {
+                    dr_account_new.debits_posted += amount;
+                    cr_account_new.credits_posted += amount;
                 }
-            }
+                self.forest.grooves.accounts.update(.{ .old = dr_account, .new = &dr_account_new });
+                self.forest.grooves.accounts.update(.{ .old = cr_account, .new = &cr_account_new });
 
-            // Don't update `commit_timestamp` with past timestamps when importing.
-            if (operation == .create_transfers) self.commit_timestamp = t.timestamp;
+                self.historical_balance(.{
+                    .transfer = &t2,
+                    .dr_account = &dr_account_new,
+                    .cr_account = &cr_account_new,
+                });
 
-            return .ok;
+                if (t.timeout > 0) {
+                    assert(t.flags.pending);
+                    assert(operation == .create_transfers);
+                    const expires_at = t.timestamp + t.timeout_ns();
+                    if (expires_at < self.expire_pending_transfers.pulse_next_timestamp) {
+                        self.expire_pending_transfers.pulse_next_timestamp = expires_at;
+                    }
+                }
+
+                // Don't update `commit_timestamp` with past timestamps when importing.
+                if (operation == .create_transfers) self.commit_timestamp = t2.timestamp;
+
+                break :completed_atomically .ok;
+            };
+            return result;
         }
 
         fn create_transfer_exists(t: *const Transfer, e: *const Transfer) CreateTransferResult {
@@ -1778,71 +1782,75 @@ pub fn StateMachineType(
                 break :expires_at expires_at;
             };
 
-            // After this point, the transfer must succeed.
-            defer assert(self.commit_timestamp == t.timestamp);
+            // After this point, the transfer must succeed atomically.
+            var result: CreateTransferResult = undefined;
+            defer assert(result == .ok);
+            defer if (operation == .create_transfers) assert(self.commit_timestamp == t.timestamp);
+            result = completed_atomically: {
+                const t2 = Transfer{
+                    .id = t.id,
+                    .debit_account_id = p.debit_account_id,
+                    .credit_account_id = p.credit_account_id,
+                    .user_data_128 = if (t.user_data_128 > 0) t.user_data_128 else p.user_data_128,
+                    .user_data_64 = if (t.user_data_64 > 0) t.user_data_64 else p.user_data_64,
+                    .user_data_32 = if (t.user_data_32 > 0) t.user_data_32 else p.user_data_32,
+                    .ledger = p.ledger,
+                    .code = p.code,
+                    .pending_id = t.pending_id,
+                    .timeout = 0,
+                    .timestamp = t.timestamp,
+                    .flags = t.flags,
+                    .amount = amount,
+                };
+                self.forest.grooves.transfers.insert(&t2);
 
-            const t2 = Transfer{
-                .id = t.id,
-                .debit_account_id = p.debit_account_id,
-                .credit_account_id = p.credit_account_id,
-                .user_data_128 = if (t.user_data_128 > 0) t.user_data_128 else p.user_data_128,
-                .user_data_64 = if (t.user_data_64 > 0) t.user_data_64 else p.user_data_64,
-                .user_data_32 = if (t.user_data_32 > 0) t.user_data_32 else p.user_data_32,
-                .ledger = p.ledger,
-                .code = p.code,
-                .pending_id = t.pending_id,
-                .timeout = 0,
-                .timestamp = t.timestamp,
-                .flags = t.flags,
-                .amount = amount,
-            };
-            self.forest.grooves.transfers.insert(&t2);
+                if (expires_at_maybe) |expires_at| {
+                    // Removing the pending `expires_at` index.
+                    self.forest.grooves.transfers.indexes.expires_at.remove(&.{
+                        .field = expires_at,
+                        .timestamp = p.timestamp,
+                    });
 
-            if (expires_at_maybe) |expires_at| {
-                // Removing the pending `expires_at` index.
-                self.forest.grooves.transfers.indexes.expires_at.remove(&.{
-                    .field = expires_at,
-                    .timestamp = p.timestamp,
+                    // In case the pending transfer's timeout is exactly the one we are using
+                    // as flag, we need to zero the value to run the next `pulse`.
+                    if (self.expire_pending_transfers.pulse_next_timestamp == expires_at) {
+                        self.expire_pending_transfers.pulse_next_timestamp = TimestampRange.timestamp_min;
+                    }
+                }
+
+                self.transfer_update_pending_status(transfer_pending, status: {
+                    if (t.flags.post_pending_transfer) break :status .posted;
+                    if (t.flags.void_pending_transfer) break :status .voided;
+                    unreachable;
                 });
 
-                // In case the pending transfer's timeout is exactly the one we are using
-                // as flag, we need to zero the value to run the next `pulse`.
-                if (self.expire_pending_transfers.pulse_next_timestamp == expires_at) {
-                    self.expire_pending_transfers.pulse_next_timestamp = TimestampRange.timestamp_min;
+                var dr_account_new = dr_account.*;
+                var cr_account_new = cr_account.*;
+                dr_account_new.debits_pending -= p.amount;
+                cr_account_new.credits_pending -= p.amount;
+
+                if (t.flags.post_pending_transfer) {
+                    assert(amount > 0);
+                    assert(amount <= p.amount);
+                    dr_account_new.debits_posted += amount;
+                    cr_account_new.credits_posted += amount;
                 }
-            }
 
-            self.transfer_update_pending_status(transfer_pending, status: {
-                if (t.flags.post_pending_transfer) break :status .posted;
-                if (t.flags.void_pending_transfer) break :status .voided;
-                unreachable;
-            });
+                self.forest.grooves.accounts.update(.{ .old = dr_account, .new = &dr_account_new });
+                self.forest.grooves.accounts.update(.{ .old = cr_account, .new = &cr_account_new });
 
-            var dr_account_new = dr_account.*;
-            var cr_account_new = cr_account.*;
-            dr_account_new.debits_pending -= p.amount;
-            cr_account_new.credits_pending -= p.amount;
+                self.historical_balance(.{
+                    .transfer = &t2,
+                    .dr_account = &dr_account_new,
+                    .cr_account = &cr_account_new,
+                });
 
-            if (t.flags.post_pending_transfer) {
-                assert(amount > 0);
-                assert(amount <= p.amount);
-                dr_account_new.debits_posted += amount;
-                cr_account_new.credits_posted += amount;
-            }
+                // Don't update `commit_timestamp` with past timestamps when importing.
+                if (operation == .create_transfers) self.commit_timestamp = t2.timestamp;
 
-            self.forest.grooves.accounts.update(.{ .old = dr_account, .new = &dr_account_new });
-            self.forest.grooves.accounts.update(.{ .old = cr_account, .new = &cr_account_new });
-
-            self.historical_balance(.{
-                .transfer = &t2,
-                .dr_account = &dr_account_new,
-                .cr_account = &cr_account_new,
-            });
-
-            // Don't update `commit_timestamp` with past timestamps when importing.
-            if (operation == .create_transfers) self.commit_timestamp = t.timestamp;
-
-            return .ok;
+                break :completed_atomically .ok;
+            };
+            return result;
         }
 
         fn post_or_void_pending_transfer_exists(
